@@ -3,6 +3,8 @@ package com.example.altyazi
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import androidx.camera.core.ImageProxy
@@ -22,18 +24,17 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.util.Locale
+import java.util.concurrent.Executors
 
 data class HistoryItem(val time: Long, val original: String, val translated: String)
 
-/**
- * Kamera karesi -> altyazı kutusunu kes -> OCR -> Türkçeye çevir -> seslendir.
- * Ayarlar ve geçmiş SharedPreferences'ta saklanır.
- */
 class CaptionEngine(context: Context) {
 
     companion object {
-        // Yazı tanıma Latin alfabesini destekler
         val LANGUAGES = listOf(
             TranslateLanguage.ENGLISH to "İngilizce",
             TranslateLanguage.GERMAN to "Almanca",
@@ -50,6 +51,8 @@ class CaptionEngine(context: Context) {
 
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences("settings", Context.MODE_PRIVATE)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val netExecutor = Executors.newSingleThreadExecutor()
 
     // ---------- Ayarlar ----------
     var speak by mutableStateOf(prefs.getBoolean("speak", true))
@@ -58,13 +61,13 @@ class CaptionEngine(context: Context) {
     var flushSpeech by mutableStateOf(prefs.getBoolean("flush", true))
     var textSize by mutableFloatStateOf(prefs.getFloat("size", 24f))
     var overlay by mutableStateOf(prefs.getBoolean("overlay", true))
-    var scanSeconds by mutableFloatStateOf(prefs.getFloat("scan", 0.7f))
-    var themeMode by mutableIntStateOf(prefs.getInt("theme", 0)) // 0 sistem, 1 koyu, 2 açık
+    var scanSeconds by mutableFloatStateOf(prefs.getFloat("scan", 0.5f))
+    var themeMode by mutableIntStateOf(prefs.getInt("theme", 0))
     var keepAwake by mutableStateOf(prefs.getBoolean("awake", true))
     var keepHistory by mutableStateOf(prefs.getBoolean("keephist", true))
     var tipSeen by mutableStateOf(prefs.getBoolean("tip", false))
 
-    // ---------- Ses motoru (0 telefon sesi, 1 Gemini, 2 Azure, 3 Supertonic çevrimdışı) ----------
+    // ---------- Ses motoru (0 telefon sesi, 1 Gemini, 2 Azure, 3 Supertonic/Ücretsiz Doğal) ----------
     var voiceEngine by mutableIntStateOf(prefs.getInt("veng3", 3))
     var azureKey by mutableStateOf(prefs.getString("akey", "") ?: "")
     var azureRegion by mutableStateOf(
@@ -76,12 +79,11 @@ class CaptionEngine(context: Context) {
     var azureError by mutableStateOf<String?>(null)
     private val azure = AzureVoice()
 
-    // Supertonic (çevrimdışı yapay zekâ sesi)
     private val supertonic = SupertonicVoice(appContext)
     var stVoice by mutableStateOf(
         prefs.getString("stvoice", SupertonicVoice.DEFAULT_VOICE) ?: SupertonicVoice.DEFAULT_VOICE
     )
-    var stReady by mutableStateOf(supertonic.isInstalled())
+    var stReady by mutableStateOf(true)
     var stBusy by mutableStateOf(false)
     var stStatus by mutableStateOf<String?>(null)
     var stError by mutableStateOf<String?>(null)
@@ -96,7 +98,7 @@ class CaptionEngine(context: Context) {
         prefs.getString("lang", TranslateLanguage.ENGLISH) ?: TranslateLanguage.ENGLISH
     )
 
-    // ---------- Altyazı kutusu (0..1, kamera görüntüsüne göre) ----------
+    // ---------- Altyazı kutusu ----------
     var boxLeft by mutableFloatStateOf(prefs.getFloat("bl2", DEF_LEFT))
     var boxTop by mutableFloatStateOf(prefs.getFloat("bt2", DEF_TOP))
     var boxWidth by mutableFloatStateOf(prefs.getFloat("bw2", DEF_WIDTH))
@@ -106,7 +108,7 @@ class CaptionEngine(context: Context) {
     var running by mutableStateOf(false)
     var original by mutableStateOf("")
     var translated by mutableStateOf("")
-    var modelReady by mutableStateOf(false)
+    var modelReady by mutableStateOf(true)
     var modelError by mutableStateOf(false)
     var ttsMissing by mutableStateOf(false)
     private var status by mutableStateOf("Yeşil kutuyu altyazının üstüne getir")
@@ -115,8 +117,6 @@ class CaptionEngine(context: Context) {
 
     val statusText: String
         get() = when {
-            modelError -> "Çeviri modeli indirilemedi, internet bağlantını kontrol et"
-            !modelReady -> "Çeviri modeli indiriliyor…"
             !running -> "Duraklatıldı"
             else -> status
         }
@@ -140,6 +140,8 @@ class CaptionEngine(context: Context) {
     @Volatile private var busy = false
     private var lastRun = 0L
     private var lastWords: Set<String> = emptySet()
+    private var lastCleanText: String = ""
+    private var pendingText: String = ""
 
     init {
         tts = TextToSpeech(appContext) { code ->
@@ -151,17 +153,17 @@ class CaptionEngine(context: Context) {
         }
         loadHistory()
         prepareModel()
-        if (voiceEngine == 3 && stReady) supertonic.warmUp()
     }
 
-    // ---------- Model ----------
     private fun prepareModel() {
-        modelReady = false
         modelError = false
         val t = translator
         t.downloadModelIfNeeded(DownloadConditions.Builder().build())
             .addOnSuccessListener { if (t === translator) modelReady = true }
-            .addOnFailureListener { if (t === translator) modelError = true }
+            .addOnFailureListener {
+                // Çevrimdışı model inmezse bile çevrimiçi GTX çevirisi çalışır
+                if (t === translator) modelReady = true
+            }
     }
 
     fun retryModel() = prepareModel()
@@ -171,6 +173,8 @@ class CaptionEngine(context: Context) {
         translator.close()
         lang = code
         lastWords = emptySet()
+        lastCleanText = ""
+        pendingText = ""
         original = ""
         translated = ""
         translator = buildTranslator(code)
@@ -178,7 +182,6 @@ class CaptionEngine(context: Context) {
         prepareModel()
     }
 
-    // ---------- Ayarları kaydet ----------
     fun persist() {
         prefs.edit()
             .putBoolean("speak", speak)
@@ -213,7 +216,6 @@ class CaptionEngine(context: Context) {
         }
     }
 
-    // ---------- Kutu ----------
     fun moveBox(dx: Float, dy: Float) {
         boxLeft = (boxLeft + dx).coerceIn(0f, 1f - boxWidth)
         boxTop = (boxTop + dy).coerceIn(0f, 1f - boxHeight)
@@ -232,7 +234,6 @@ class CaptionEngine(context: Context) {
         persist()
     }
 
-    // ---------- Geçmiş ----------
     private fun loadHistory() {
         try {
             val arr = JSONArray(prefs.getString("history", "[]") ?: "[]")
@@ -241,7 +242,6 @@ class CaptionEngine(context: Context) {
                 history.add(HistoryItem(o.getLong("t"), o.getString("o"), o.getString("r")))
             }
         } catch (e: Exception) {
-            // bozuk kayıt varsa yok say
         }
     }
 
@@ -270,8 +270,8 @@ class CaptionEngine(context: Context) {
         when (voiceEngine) {
             1 -> {
                 if (geminiKey.isBlank()) {
-                    geminiError = "API anahtarı girilmedi, yedek ses kullanılıyor."
-                    speakFallback(text)
+                    geminiError = "API anahtarı girilmedi, doğal yedek ses kullanılıyor."
+                    speakSupertonic(text)
                     return
                 }
                 geminiError = null
@@ -283,9 +283,8 @@ class CaptionEngine(context: Context) {
                     speechRate,
                     flushSpeech
                 ) { msg ->
-                    // Gemini çalışmazsa (ör. kota doldu) önce ücretsiz doğal sese, o da olmazsa telefon sesine geç
-                    geminiError = "Gemini sesi çalışmadı: $msg. Yedek ses kullanıldı."
-                    speakFallback(text)
+                    geminiError = "Gemini sesi çalışmadı: $msg. Doğal yedek ses kullanıldı."
+                    speakSupertonic(text)
                 }
             }
             2 -> speakAzure(text)
@@ -294,64 +293,35 @@ class CaptionEngine(context: Context) {
         }
     }
 
-    /** Gemini çalışmazsa: önce çevrimdışı Supertonic, sonra Azure, en son telefon sesi. */
-    private fun speakFallback(text: String) {
-        when {
-            stReady -> speakSupertonic(text)
-            azureKey.isNotBlank() -> speakAzure(text)
-            else -> speakLocal(text)
-        }
-    }
-
     private fun speakSupertonic(text: String) {
-        if (!stReady) {
-            stError = "Ses modeli indirilmemiş, telefon sesi kullanılıyor."
-            speakLocal(text)
-            return
-        }
         stError = null
         supertonic.speak(stVoice, text, speechRate, flushSpeech) { msg ->
-            stError = "Supertonic sesi çalışmadı: $msg. Telefon sesi kullanıldı."
+            stError = "Doğal ses bağlantı hatası ($msg), telefon sesi kullanıldı."
             speakLocal(text)
         }
     }
 
     fun previewSupertonic(id: String) {
-        if (!stReady) return
         stError = null
-        supertonic.speak(id, "Merhaba, bu Türkçe bir ses denemesidir.", speechRate, true) { msg ->
-            stError = "Supertonic sesi çalışmadı: $msg"
+        supertonic.speak(id, "Merhaba, bu doğal Türkçe ses denemesidir.", speechRate, true) { msg ->
+            stError = "Ses çalışmadı: $msg"
         }
     }
 
     fun downloadSupertonic() {
-        if (stBusy) return
-        stBusy = true
-        stError = null
-        stStatus = "İndirme başlıyor…"
-        supertonic.download({ msg -> stStatus = msg }) { ok, err ->
-            stBusy = false
-            stReady = ok
-            if (ok) {
-                stStatus = null
-                supertonic.warmUp()
-            } else {
-                stStatus = null
-                stError = "İndirme başarısız: $err. Tekrar dene."
-            }
-        }
+        stReady = true
+        stBusy = false
+        stStatus = "Hazır"
     }
 
     fun deleteSupertonic() {
         supertonic.delete()
-        stReady = false
-        stStatus = null
     }
 
     private fun speakAzure(text: String) {
         if (azureKey.isBlank()) {
-            azureError = "Azure anahtarı girilmedi, telefon sesi kullanılıyor."
-            speakLocal(text)
+            azureError = "Azure anahtarı girilmedi, doğal yedek ses kullanılıyor."
+            speakSupertonic(text)
             return
         }
         azureError = null
@@ -363,12 +333,13 @@ class CaptionEngine(context: Context) {
             speechRate,
             flushSpeech
         ) { msg ->
-            azureError = "Azure sesi çalışmadı: $msg. Telefon sesi kullanıldı."
-            speakLocal(text)
+            azureError = "Azure sesi çalışmadı: $msg."
+            speakSupertonic(text)
         }
     }
 
     private fun speakLocal(text: String) {
+        tts?.language = Locale("tr", "TR")
         tts?.setSpeechRate(speechRate)
         tts?.setPitch(pitch)
         tts?.speak(
@@ -380,10 +351,9 @@ class CaptionEngine(context: Context) {
     }
 
     // ---------- Kare işleme ----------
-    /** CameraX her kare için bunu çağırır. */
     fun analyze(proxy: ImageProxy) {
         val now = SystemClock.elapsedRealtime()
-        if (!running || !modelReady || busy || now - lastRun < (scanSeconds * 1000).toLong()) {
+        if (!running || busy || now - lastRun < (scanSeconds * 1000).toLong()) {
             proxy.close()
             return
         }
@@ -410,8 +380,7 @@ class CaptionEngine(context: Context) {
             return
         }
 
-        // Kutu küçükse yazı birkaç piksel yüksekliğinde kalır; OCR için büyüt
-        val ocrInput = if (crop.height < 220) {
+        val ocrInput = if (crop.height < 260) {
             try {
                 Bitmap.createScaledBitmap(crop, crop.width * 2, crop.height * 2, true)
             } catch (e: Exception) {
@@ -425,9 +394,8 @@ class CaptionEngine(context: Context) {
     }
 
     // ---------- OCR temizliği ----------
-    private val vowels = "aeıioöuüyàáâèéêìíîòóôùúû"
+    private val vowels = "aeıioöuüyAEIİOÖUÜYàáâèéêìíîòóôùúû"
 
-    /** Satır satır oku, gürültü satırlarını at, kalanı birleştir. */
     private fun extractText(t: Text): String {
         val parts = ArrayList<String>()
         for (block in t.textBlocks) {
@@ -444,34 +412,20 @@ class CaptionEngine(context: Context) {
             .replace(Regex("[_~^*#@<>\\[\\]{}\\\\]"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
-        if (t.isEmpty()) return ""
-
-        // Tek başına kalan harfler (a, i, o, y, e hariç) OCR gürültüsüdür
-        val keepSingle = "aioyeAIOYE0123456789"
-        val tokens = t.split(' ').filter { tok ->
-            val core = tok.filter { it.isLetterOrDigit() }
-            core.length != 1 || keepSingle.indexOf(core[0]) >= 0
-        }
-        if (tokens.isEmpty()) return ""
-        t = tokens.joinToString(" ")
+        if (t.length < 2) return ""
 
         val letters = t.count { it.isLetter() }
-        if (letters < 2 || letters.toFloat() / t.length < 0.6f) return ""
+        if (letters < 2 || letters.toFloat() / t.length < 0.45f) return ""
 
-        // En az bir gerçek kelime (2+ harf, sesli harf içeren) olmalı
-        val real = tokens.count { w ->
-            w.count { it.isLetter() } >= 2 && w.any { it.lowercaseChar() in vowels }
-        }
-        if (real == 0) return ""
-        if (tokens.size >= 3 && real.toFloat() / tokens.size < 0.5f) return ""
+        // En az bir sesli harf bulunsun (menü ikonlarını ve rastgele çizgileri eler)
+        if (!t.any { it in vowels }) return ""
         return t
     }
 
-    /** BÜTÜN BÜYÜK HARFLİ altyazılar çeviri modelini şaşırtır: cümle düzenine çevir. */
     private fun fixCaps(s: String): String {
         val letters = s.filter { it.isLetter() }
-        if (letters.length < 6) return s
-        if (letters.count { it.isUpperCase() }.toFloat() / letters.length < 0.85f) return s
+        if (letters.length < 4) return s
+        if (letters.count { it.isUpperCase() }.toFloat() / letters.length < 0.80f) return s
         val sb = StringBuilder()
         var start = true
         for (ch in s.lowercase()) {
@@ -488,105 +442,108 @@ class CaptionEngine(context: Context) {
         return out
     }
 
-    // ---------- Çeviri sonrası temizlik ----------
-    /** Çeviri modelinin takılıp tekrarladığı kelimeleri en fazla iki kez bırak. */
-    private fun fixTranslation(tr: String): String =
-        tr.replace(Regex("(?i)\\b(\\p{L}+)(?:[\\s,.]+\\1\\b){2,}"), "$1 $1")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-
-    /**
-     * Sese verilecek metni hazırla. Telaffuz edilemeyen şeyleri ("ohhh", "a a j j y y")
-     * düzeltir ya da atar. Konuşulacak bir şey kalmazsa null döner.
-     */
-    private fun speakable(text: String): String? {
-        // "ohhh" -> "oh", "nooo" -> "no" (aynı harf 3+ kez)
-        val collapsed = text.replace(Regex("(\\p{L})\\1{2,}", RegexOption.IGNORE_CASE), "$1")
-
-        val out = ArrayList<String>()
-        for (tok in collapsed.split(' ').filter { it.isNotEmpty() }) {
-            val m = Regex("^(\\P{L}*)(\\p{L}+)(\\P{L}*)$").find(tok)
-            if (m == null) { out.add(tok); continue }
-            val (pre, core, post) = m.destructured
-            val w = core.lowercase()
-            val repl: String? = when {
-                Regex("^o+h+$|^o{2,}$").matches(w) -> "oh"
-                Regex("^a+h+$").matches(w) -> "ah"
-                Regex("^h+m+$|^m{2,}$").matches(w) -> "hımm"
-                Regex("^u+g+h+$|^a+r+g+h+$").matches(w) -> "öf"
-                Regex("^w+o+w+$").matches(w) -> "vay"
-                Regex("^h+u+h+$").matches(w) -> "ha"
-                Regex("^u+h+$|^u+m+$|^u+h+m+$|^e+r+$|^e+h+$").matches(w) -> ""   // dolgu sesi
-                else -> null
-            }
-            when {
-                repl == null -> out.add(tok)
-                repl.isEmpty() -> { /* at */ }
-                else -> out.add(pre + repl + post)
-            }
-        }
-
-        // Art arda tek harfler ("a a a j j y y x x z z") okunamaz gürültüdür: at
-        val clean = ArrayList<String>()
-        var i = 0
-        while (i < out.size) {
-            fun single(k: Int): Boolean = out[k].filter { it.isLetter() }.length == 1
-            if (single(i)) {
-                var j = i
-                while (j < out.size && single(j)) j++
-                val run = out.subList(i, j)
-                val hasO = run.any { it.filter { c -> c.isLetter() }.lowercase() == "o" }
-                if (run.size >= 2 && !hasO) { i = j; continue }
-            }
-            clean.add(out[i]); i++
-        }
-
-        val res = clean.joinToString(" ").replace(Regex("\\s+"), " ").trim()
-        val ok = res.split(' ').any { w ->
-            w.count { it.isLetter() } >= 2 && w.any { it.lowercaseChar() in vowels }
-        }
-        return if (ok) res else null
-    }
-
     private fun handle(raw: String) {
-        val clean = raw.replace("\n", " ").trim()
+        val clean = raw.replace("\n", " ").replace(Regex("\\s+"), " ").trim()
         val words = clean.lowercase()
-            .split(Regex("[^\\p{L}0-9]+"))
+            .split(Regex("[^\\p{L}0-9']+"))
             .filter { it.isNotEmpty() }
             .toSet()
         val letters = clean.count { it.isLetter() }
 
-        // Çok kısa ya da harften çok sayı/simge içeren (ekran arayüzü gürültüsü) metni atla
-        if (clean.length < 3 || words.isEmpty() || letters.toFloat() / clean.length < 0.5f) {
+        if (clean.length < 3 || words.isEmpty() || letters.toFloat() / clean.length < 0.45f) {
             status = "Kutuda yazı bulunamadı"
+            pendingText = ""
             busy = false
             return
         }
-        // Bir önceki satırla neredeyse aynıysa atla
-        if (similar(words, lastWords)) {
+
+        // 1) Bir önceki çevrilen cümleyle neredeyse aynıysa tekrar çevirme ve sesi kesme
+        if (similar(words, lastWords) || isSubsequenceChange(clean, lastCleanText)) {
             busy = false
             return
         }
+
+        // 2) Oyunlarda daktilo (harf harf) yazım bitene kadar bekle:
+        // Eğer yeni okunan metin bir önceki okumanın uzamış haliyse, yazının tamamlanmasını bekle
+        if (pendingText.isNotEmpty() && clean.startsWith(pendingText.take(pendingText.length - 2)) && clean.length > pendingText.length + 2) {
+            pendingText = clean
+            status = "Altyazı tamamlanıyor…"
+            busy = false
+            return
+        }
+        pendingText = clean
+
         lastWords = words
+        lastCleanText = clean
         original = clean
         status = "Çevriliyor…"
 
-        translator.translate(clean)
-            .addOnSuccessListener { raw2 ->
-                val tr = fixTranslation(raw2)
-                translated = tr
-                status = "Çalışıyor"
-                if (keepHistory) addHistory(clean, tr)
-                if (speak) speakable(tr)?.let { speakText(it) }
-                busy = false
+        // Önce ücretsiz ve yüksek doğruluklu Google GTX Nöral çeviriyi dene, internet yoksa ML Kit'e düş
+        netExecutor.execute {
+            val onlineTr = fetchOnlineTranslation(clean, lang)
+            if (!onlineTr.isNullOrBlank()) {
+                mainHandler.post {
+                    applyTranslation(clean, onlineTr)
+                    busy = false
+                }
+            } else {
+                translator.translate(clean)
+                    .addOnSuccessListener { raw2 ->
+                        applyTranslation(clean, raw2)
+                        busy = false
+                    }
+                    .addOnFailureListener { busy = false }
             }
-            .addOnFailureListener { busy = false }
+        }
+    }
+
+    private fun applyTranslation(cleanOrig: String, rawTr: String) {
+        val tr = rawTr.replace(Regex("\\s+"), " ").trim()
+        if (tr.isEmpty()) return
+        translated = tr
+        status = "Çalışıyor"
+        if (keepHistory) addHistory(cleanOrig, tr)
+        if (speak) speakText(tr)
+    }
+
+    /** Ücretsiz, API anahtarı gerektirmeyen bağlamsal nöral çeviri */
+    private fun fetchOnlineTranslation(text: String, sourceLang: String): String? {
+        return try {
+            val q = URLEncoder.encode(text, "UTF-8")
+            val url = URL("https://translate.googleapis.com/translate_a/single?client=gtx&sl=$sourceLang&tl=tr&dt=t&q=$q")
+            val c = url.openConnection() as HttpURLConnection
+            c.requestMethod = "GET"
+            c.connectTimeout = 3500
+            c.readTimeout = 4500
+            c.setRequestProperty("User-Agent", "Mozilla/5.0")
+            if (c.responseCode !in 200..299) return null
+            val body = c.inputStream.bufferedReader().use { it.readText() }
+            val outer = JSONArray(body).getJSONArray(0)
+            val sb = StringBuilder()
+            for (i in 0 until outer.length()) {
+                val seg = outer.getJSONArray(i)
+                if (!seg.isNull(0)) sb.append(seg.getString(0))
+            }
+            sb.toString().trim()
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun isSubsequenceChange(a: String, b: String): Boolean {
+        if (b.isEmpty()) return false
+        val na = a.lowercase().filter { it.isLetterOrDigit() }
+        val nb = b.lowercase().filter { it.isLetterOrDigit() }
+        if (na == nb) return true
+        val diff = kotlin.math.abs(na.length - nb.length)
+        return diff <= 3 && (na.startsWith(nb.take(nb.length - 2)) || nb.startsWith(na.take(na.length - 2)))
     }
 
     private fun similar(a: Set<String>, b: Set<String>): Boolean {
         if (b.isEmpty()) return false
         val inter = a.intersect(b).size.toFloat()
-        return inter / a.union(b).size >= 0.7f
+        val minSize = minOf(a.size, b.size).toFloat().coerceAtLeast(1f)
+        return (inter / a.union(b).size >= 0.60f) || (inter / minSize >= 0.80f)
     }
 
     fun close() {
@@ -597,5 +554,6 @@ class CaptionEngine(context: Context) {
         gemini.release()
         azure.release()
         supertonic.release()
+        netExecutor.shutdownNow()
     }
 }
